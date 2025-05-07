@@ -60,7 +60,7 @@ void *th_manager(void *arg) {
 
             lineBuffer[lineCount % buffer_size] = strdup(line);
             lineCount++;
-            printf("line read: %s\n",line);
+            //printf("line read: %s\n",line);
             pthread_cond_signal(&not_empty);
             pthread_mutex_unlock(&mutex);
 
@@ -134,7 +134,7 @@ void *th_worker(void *arg) {
 
         // Check for EOF marker
         if (line == EOF_MARKER) {
-            printf("end of file\n");
+            //printf("end of file\n");
             break;
         }
 
@@ -145,7 +145,7 @@ void *th_worker(void *arg) {
             local_matches++;
             ptr += strlen(search_term);
         }
-          printf("line in worker %d: %s\n",thread_id,line);
+          //printf("line in worker %d: %s\n",thread_id,line);
         if (local_matches > 0) {
             printf("[Worker %d] Keyword found %d time(s) in line %d: %s\n", thread_id, local_matches, index + 1, line);
             match_count += local_matches;
