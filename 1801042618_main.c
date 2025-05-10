@@ -5,6 +5,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <signal.h>
+#include <ctype.h>
+#include <time.h>
 
 #define EOF_MARKER NULL
 char *fileName;
@@ -16,7 +18,7 @@ char *search_term;
 int *worker_matches;
 
 int total_matches=0;
-
+int file_opened=1;
 volatile sig_atomic_t stop = 0;
 
 
@@ -32,50 +34,68 @@ void sigint_handler(int signum) {
     pthread_cond_broadcast(&not_empty);
 }
 
+void to_lowercase(char *str) {
+    while (*str) {
+        *str = tolower(*str);
+        str++;
+    }
+}
+
 void *th_manager(void *arg) {
     int fd = open(fileName, O_RDONLY);
     if (fd < 0) {
         perror("open");
-        pthread_exit(NULL);
-    }
+        file_opened = 0;
+        stop = 1;
 
-    char ch;
+        pthread_cond_broadcast(&not_full);
+        pthread_cond_broadcast(&not_empty);
+        return NULL;
+    }
+    printf("File opened successfully.\n"); // Debugging line
+
+    char read_buf[4096];
     char line[1024];
     int linePos = 0;
+    ssize_t bytes_read;
+    int i;
 
-    while (read(fd, &ch, 1) > 0) {
-        if (ch == '\n' || linePos == sizeof(line) - 1) {
-            line[linePos] = '\0';
+    while ((bytes_read = read(fd, read_buf, sizeof(read_buf))) > 0) {
+        //printf("Read %ld bytes\n", bytes_read);  // Debugging line
+        for (i = 0; i < bytes_read; i++) {
+            char ch = read_buf[i];
+            if (ch == '\n' || linePos == sizeof(line) - 1) {
+                line[linePos] = '\0';
 
-            pthread_mutex_lock(&mutex);
-            while ((lineCount - nextLine) >= buffer_size && !stop) {
-                pthread_cond_wait(&not_full, &mutex);
+                pthread_mutex_lock(&mutex);
+                while ((lineCount - nextLine) >= buffer_size && !stop) {
+                    pthread_cond_wait(&not_full, &mutex);
+                }
+                if (stop) {
+                    pthread_mutex_unlock(&mutex);
+                    close(fd);
+                    return NULL;
+                }
+
+                lineBuffer[lineCount % buffer_size] = strdup(line);
+                lineCount++;
+                pthread_cond_signal(&not_empty);
+                pthread_mutex_unlock(&mutex);
+
+                linePos = 0;
+            } else {
+                line[linePos++] = ch;
             }
+
             if (stop) {
                 pthread_mutex_unlock(&mutex);
                 close(fd);
                 return NULL;
             }
-
-
-            lineBuffer[lineCount % buffer_size] = strdup(line);
-            lineCount++;
-            //printf("line read: %s\n",line);
-            pthread_cond_signal(&not_empty);
-            pthread_mutex_unlock(&mutex);
-
-            linePos = 0;
-        } else {
-            line[linePos++] = ch;
         }
-        if (stop) {
-		    pthread_mutex_unlock(&mutex);
-		    close(fd);
-		    return NULL;
-		}    
-		}
+    }
 
-    // Handle last line 
+    // Handle last line
     if (linePos > 0) {
         line[linePos] = '\0';
         pthread_mutex_lock(&mutex);
@@ -96,7 +116,7 @@ void *th_manager(void *arg) {
         while ((lineCount - nextLine) >= buffer_size) {
             pthread_cond_wait(&not_full, &mutex);
         }
-        lineBuffer[lineCount % buffer_size] = EOF_MARKER;  
+        lineBuffer[lineCount % buffer_size] = EOF_MARKER;
         lineCount++;
         pthread_cond_signal(&not_empty);
         pthread_mutex_unlock(&mutex);
@@ -106,12 +126,15 @@ void *th_manager(void *arg) {
 }
 
 
+
 void *th_worker(void *arg) {
     int thread_id = *(int *)arg;
     
     free(arg); 
     int match_count = 0;
-
+    if (!file_opened || stop) {
+    return NULL;
+    }
     while (1) {
         char *line = NULL;
         int index;
@@ -120,7 +143,7 @@ void *th_worker(void *arg) {
         while (lineCount <= nextLine && !stop) {
             pthread_cond_wait(&not_empty, &mutex);
         }
-        if (stop) {
+        if (stop || !file_opened) {
             pthread_mutex_unlock(&mutex);
             break;
         }
@@ -134,13 +157,16 @@ void *th_worker(void *arg) {
 
         // Check for EOF marker
         if (line == EOF_MARKER) {
-            //printf("end of file\n");
+           // printf("end of file\n");
             break;
         }
 
         // Count keyword occurrences
-        char *ptr = line;
+        
         int local_matches = 0;
+       
+        to_lowercase(line);
+        char *ptr = line;
         while ((ptr = strstr(ptr, search_term)) != NULL) {
             local_matches++;
             ptr += strlen(search_term);
@@ -150,10 +176,12 @@ void *th_worker(void *arg) {
             printf("[Worker %d] Keyword found %d time(s) in line %d: %s\n", thread_id, local_matches, index + 1, line);
             match_count += local_matches;
         }
-
+        //printf("[Worker %d] Keyword found %d time(s) in line %d: %s\n", thread_id, local_matches, index + 1, line);
 
         free(line);
     }
+
+
     pthread_mutex_lock(&mutex);
     worker_matches[thread_id-1] += match_count;
     pthread_mutex_unlock(&mutex);
@@ -165,9 +193,9 @@ void *th_worker(void *arg) {
 void *th_final_report(void *arg){
 	pthread_barrier_wait(&barrier);
 
-	if(stop){
-		return NULL;
-	}
+	if (!file_opened) {
+    return NULL;
+}
 	printf("\nSummary report:\n");
 	for(int i=0 ; i<num_workers; i++){
 		printf("Worker %d found %d match(es)\n",i+1,worker_matches[i]);
@@ -191,11 +219,12 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, sigint_handler);
 
+clock_t start = clock();
     buffer_size = atoi(argv[1]);
     num_workers = atoi(argv[2]);
     fileName = argv[3];
     search_term = argv[4];
-
+    to_lowercase(search_term);
     worker_matches = malloc(num_workers * sizeof(int));
 	for (int i = 0; i < num_workers; i++) {
 	    worker_matches[i] = 0;  // Initialize each worker's match count to 0
@@ -211,27 +240,30 @@ int main(int argc, char *argv[]) {
     int worker_ids[num_workers];
     pthread_t final_report;
 
-    pthread_barrier_init(&barrier, NULL, num_workers + 1); 
-
-    pthread_create(&manager, NULL, th_manager, NULL);
-
     
+    pthread_barrier_init(&barrier, NULL, num_workers + 1);
+    pthread_create(&manager, NULL, th_manager, NULL);
+    
+   
     for (int i = 0; i < num_workers; i++) {
 	   	int *thread_id = malloc(sizeof(int));
 	    *thread_id = i + 1;
 	    pthread_create(&workers[i], NULL, th_worker, thread_id);
 	}
-	sleep(1);
+	//sleep(1);
+    pthread_join(manager, NULL);
 	pthread_create(&final_report,NULL,th_final_report,NULL);
 	//printf("Final Report: Total matches found: %d\n", total_matches);
-    pthread_join(manager, NULL);
+    
 
     for (int i = 0; i < num_workers; i++) {
         pthread_join(workers[i], NULL);
     }
 
     pthread_join(final_report,NULL);
-
+    clock_t end = clock();
+    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+    printf("\nExecution Time: %.2f seconds\n", elapsed);
     free(lineBuffer);
     pthread_barrier_destroy(&barrier);
     free(worker_matches);
